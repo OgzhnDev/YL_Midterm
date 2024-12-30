@@ -5,6 +5,8 @@
  *      Author: oguzh
  */
 
+// Bu 3.parti bir kutuphanedir.
+
 #ifndef INC_MYDS1302LIB_H_
 #define INC_MYDS1302LIB_H_
 

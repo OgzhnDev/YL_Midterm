@@ -136,7 +136,7 @@ void DS1302_Init(void)
 //	DS1302_SCK = 0;
 	HAL_GPIO_WritePin(DS1302_GPIO, DS1302_SCLK,  GPIO_PIN_RESET);
 
-	DWT->CTRL |= 1 ; // enable the counter for microsecond delay, see "void // delayUS_DWT(uint32_t us)"
+	// DWT->CTRL |= 1 ; // enable the counter for microsecond delay, see "void // delayUS_DWT(uint32_t us)"
 }
 
 void DS1302_ReadTime(uint8_t *buf)

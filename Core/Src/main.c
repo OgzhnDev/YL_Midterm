@@ -27,13 +27,17 @@
 #include "string.h"
 #include "fatfs_sd.h"
 #include "stdio.h"
-
+#include "stdbool.h"
+#include "stdlib.h"
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#define BUFFER_SIZE		10
+#define BUFFER_SIZE			10
+#define SD_KEYWORD			"kayıt"
+#define DISCO_ON_KEYWORD	"disco on"
+#define DISCO_OFF_KEYWORD	"disco off"
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -67,19 +71,12 @@ uint8_t dataIndex = 0;
 // MicroSD Global Kart Degiskenleri
 SPI_HandleTypeDef hspi3;
 char TxBuffer[250];
+bool sdRecFlag = false;
 
 // RTC bilgisini SD karta yazmak icin global degiskenler
 FATFS FatFs;
 FIL Fil;
 FRESULT FR_Status;
-
-// RTC Global Degiskenleri
-uint8_t time_buffer[8];
-
-// buzzer state machine Global degiskenleri
-uint8_t buzzerState = 0;
-uint32_t buzzerFirstTime = 0;
-uint32_t buzzerSecondTime = 0;
 
 // rbg led state machine global degiskenleri
 uint8_t rgb_state = 0;
@@ -88,6 +85,8 @@ uint32_t rgb_first_time = 0;
 // RGB led global degiskenleri
 RGB_LED my_rgb_led;
 TIM_HandleTypeDef htim3;
+uint16_t redTone = 0;
+volatile bool discoFlag = false;
 
 // ADC okuma degiskeni
 volatile uint32_t adcBuf;
@@ -104,15 +103,17 @@ static void MX_TIM3_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_SPI3_Init(void);
 /* USER CODE BEGIN PFP */
-static void SD_Card_Test(void);
-static void writeTimeToSD(void);
-static void SD_Card_TimeLogger(void);
+static void sd_card_test(void);
+static void write_adc_to_sd(void);
+static void sd_card_adc_logger(void);
+static uint8_t map(uint16_t,uint16_t,uint16_t,uint8_t,uint8_t);
+static void rgb_disco_mode(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-static void UART_Print(char* str)
+static void uart_print(char* str)
 {
     HAL_UART_Transmit(&huart2, (uint8_t *) str, strlen(str), 100);
 }
@@ -133,14 +134,54 @@ static void print_UID(void)
 	            uid[1],
 	            uid[2]);
 
-	UART_Print(uidBuf);
+	uart_print(uidBuf);
 }
 
-void send_adc_value()
+uint8_t map(uint16_t value, uint16_t in_min, uint16_t in_max, uint8_t out_min, uint8_t out_max)
 {
-	char buf[50];
-	sprintf(buf,"ADC degeri = %lu\r\n",adcBuf);
-	UART_Print(buf);
+    return (uint8_t)((value - in_min) * (out_max - out_min) / (in_max - in_min) + out_min);
+}
+
+static void rgb_disco_mode(void)
+{
+	  switch(rgb_state)
+	  {
+		  case 0:  // Başlangıç durumu
+		  {
+			  rgb_state = 1;
+			  rgb_first_time = HAL_GetTick();
+		  } break;
+
+		  case 1:  // Kırmızı
+		  {
+			  if (HAL_GetTick() - rgb_first_time > 100)
+			  {
+				  RGB_LED_Set_Color(&my_rgb_led, 255, 0, 0);
+				  rgb_first_time = HAL_GetTick();
+				  rgb_state = 2;
+			  }
+		  } break;
+
+		  case 2:  // Yeşil
+		  {
+			  if (HAL_GetTick() - rgb_first_time > 100)
+			  {
+				  RGB_LED_Set_Color(&my_rgb_led, 0, 255, 0);
+				  rgb_first_time = HAL_GetTick();
+				  rgb_state = 3;
+			  }
+		  } break;
+
+		  case 3:  // Mavi
+		  {
+			  if (HAL_GetTick() - rgb_first_time > 100)
+			  {
+				  RGB_LED_Set_Color(&my_rgb_led, 0, 0, 255);
+				  rgb_first_time = HAL_GetTick();
+				  rgb_state = 0;
+			  }
+		  } break;
+	  }
 }
 
 /* USER CODE END 0 */
@@ -185,101 +226,42 @@ int main(void)
   // Islemcinin UID'sini oku
   // print_UID();
 
-  // RTC konfigürasyon ve set etme
-  DS1302_Init();
-  DS1302_WriteByte(DS1302_CONTROL, 0x00);	// Yazma kontrolunu kaldir
-  uint8_t set_time[8] = {0, 24, 12, 16, 20, 52, 45, 2};
-  DS1302_WriteTime(set_time);
-
   // 1 byte UART interrupt islemini baslat
   HAL_UART_Receive_IT(&huart2, &rxBuffer, 1);
 
   // RGB ledler icin gerekli PWM'leri baslat
   RGB_LED_Init(&my_rgb_led, &htim3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3);	// timer3 ch1,ch2,ch3
 
-  // 1 saniye buzzer'ı çal
-  switch (buzzerState)
-  {
-  	  case 0:
-  	  {
-  		  buzzerState = 1;
-  	  }break;
-  	  case 1:
-  	  {
-  		  buzzerFirstTime = HAL_GetTick();
-  		  buzzerState = 2;
-  		  // HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);	// Buzzer cal
-  	  }break;
-  	  case 2:
-  	  {
-  		  buzzerSecondTime = HAL_GetTick();
-  		  if (buzzerSecondTime -  buzzerFirstTime > 1000)
-  		  {
-  			// HAL_TIM_PWM_Stop(&htim1, TIM_CHANNEL_1);	// Buzzer durdur
-  			buzzerState = 0;
-  		  }
-  	  }break;
-  }
-
-  // Zamani SD Karta loglama fonksiyonu,calisması yaklasik 10 saniye suruyor
-  // SD_Card_TimeLogger();
-  // SD Kart Test Fonksiyonu, ne kadar free alan oldugunu hesapliyor
-  // SD_Card_Test();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  // ADC IT ve timer calistir
+  // ADC tetiklemek icin timer calistir
   HAL_TIM_Base_Start(&htim2);
+  // ADC interrupt calistir
   HAL_ADC_Start_IT(&hadc1);
 
   while (1)
   {
-	  send_adc_value();
-	  HAL_Delay(1000);
-//	  switch(rgb_state)
-//	  {
-//	      case 0:  // Başlangıç durumu
-//	      {
-//	          rgb_state = 1;
-//	          rgb_first_time = HAL_GetTick();
-//	      } break;
-//
-//	      case 1:  // Kırmızı
-//	      {
-//	          if (HAL_GetTick() - rgb_first_time > 1000)
-//	          {
-//	              RGB_LED_Set_Color(&my_rgb_led, 255, 0, 128);
-//	              rgb_first_time = HAL_GetTick();
-//	              rgb_state = 2;
-//	          }
-//	      } break;
-//
-//	      case 2:  // Yeşil
-//	      {
-//	          if (HAL_GetTick() - rgb_first_time > 1000)
-//	          {
-//	              RGB_LED_Set_Color(&my_rgb_led, 255, 192, 103);
-//	              rgb_first_time = HAL_GetTick();
-//	              rgb_state = 3;
-//	          }
-//	      } break;
-//
-//	      case 3:  // Mavi
-//	      {
-//	          if (HAL_GetTick() - rgb_first_time > 1000)
-//	          {
-//	              RGB_LED_Set_Color(&my_rgb_led, 50, 60, 70);
-//	              rgb_first_time = HAL_GetTick();
-//	              rgb_state = 0;
-//	          }
-//	      } break;
-//	  }
-//	  RGB_LED_Set_Color(&my_rgb_led, 0, 255, 25);
-//	  HAL_Delay(100);
-//	  RGB_LED_Set_Color(&my_rgb_led, 255, 0, 255);
-//	  HAL_Delay(100);
+	  if (sdRecFlag)
+	  {
+		  // Bu fonksiyon yaklasik 10 saniye calisir ve diger islemleri bloklar. RGB sonebilir
+		  sd_card_adc_logger();
+		  sd_card_test();
+		  sdRecFlag = false;
+	  }
+
+	  if (discoFlag)
+	  {
+		  rgb_disco_mode();
+	  }
+	  else
+	  {
+		  // ADC degerini oku ve 0-255'e map et, kırmızının tonunu ayarla
+		  redTone = map(adcBuf,0,4095,0,255);
+		  RGB_LED_Set_Color(&my_rgb_led, 0, redTone, 0);
+	  }
 
     /* USER CODE END WHILE */
 
@@ -612,41 +594,65 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
         	dataIndex = 0; // Index degerini sıfırla
         }
 
+        if (rxBuffer == '\r' || rxBuffer == '\n')
+        {
+        	receivedData[dataIndex - 1] = '\0';
+
+        	if (strstr( (char*)receivedData , SD_KEYWORD) != NULL)
+        	{
+        		sdRecFlag = true;
+        	}
+
+        	if (strstr( (char*)receivedData, DISCO_ON_KEYWORD) != NULL)
+        	{
+        		discoFlag = true;
+        	}
+
+        	if (strstr( (char*)receivedData, DISCO_OFF_KEYWORD) != NULL)
+        	{
+        		discoFlag = false;
+        	}
+
+    	    // bufferi temizle
+    	    memset(receivedData,0,BUFFER_SIZE);
+    	    dataIndex = 0;
+
+        }
         // Bir sonraki veriyi bekle
         HAL_UART_Receive_IT(&huart2, &rxBuffer, 1);
     }
 }
 
-static void SD_Card_Test(void)
+static void sd_card_test(void)
 {
   FATFS FatFs;
   FRESULT FR_Status;
   FATFS *FS_Ptr;
   DWORD FreeClusters;
-  uint32_t TotalSize, FreeSpace;
+  uint32_t totalSize, freeSpace;
 
   // SD Kart Yerlestir
   FR_Status = f_mount(&FatFs, "", 1);
   if (FR_Status != FR_OK)
   {
     sprintf(TxBuffer, "Hata! SD Kart yerleştirilemedi. Hata kodu: (%i)\r\n", FR_Status);
-    UART_Print(TxBuffer);
+    uart_print(TxBuffer);
   }
   else
   {
 	  sprintf(TxBuffer, "SD Kart Basariyla Yerlestirildi! \r\n\n");
-	  UART_Print(TxBuffer);
+	  uart_print(TxBuffer);
   }
 
   //SD Kart Hafıza Durumu kontrolü
   f_getfree("", &FreeClusters, &FS_Ptr);
 
-  TotalSize = (uint32_t)((FS_Ptr->n_fatent - 2) * FS_Ptr->csize * 0.5);
-  FreeSpace = (uint32_t)(FreeClusters * FS_Ptr->csize * 0.5);
-  sprintf(TxBuffer, "Total SD Kart Boyutu: %lu Byte\r\n", TotalSize);
-  UART_Print(TxBuffer);
-  sprintf(TxBuffer, "Boş SD Kart Boyutu: %lu Byte\r\n\n", FreeSpace);
-  UART_Print(TxBuffer);
+  totalSize = (uint32_t)((FS_Ptr->n_fatent - 2) * FS_Ptr->csize * 0.5);
+  freeSpace = (uint32_t)(FreeClusters * FS_Ptr->csize * 0.5);
+  sprintf(TxBuffer, "Total SD Kart Boyutu: %lu Byte\r\n", totalSize);
+  uart_print(TxBuffer);
+  sprintf(TxBuffer, "Boş SD Kart Boyutu: %lu Byte\r\n\n", freeSpace);
+  uart_print(TxBuffer);
 
   // Test tamamlandi
   FR_Status = f_mount(NULL, "", 0);
@@ -654,47 +660,39 @@ static void SD_Card_Test(void)
   if (FR_Status != FR_OK)
   {
       sprintf(TxBuffer, "Hata! SD Kart cikartilamadi, Hata kodu: (%i)\r\n", FR_Status);
-      UART_Print(TxBuffer);
+      uart_print(TxBuffer);
   }
   else
   {
       sprintf(TxBuffer, "SD Kart basariyla kaldirildi! \r\n");
-      UART_Print(TxBuffer);
+      uart_print(TxBuffer);
   }
 }
 
-static void writeTimeToSD(void)
+static void write_adc_to_SD(void)
 {
-	// Zaman bilgisini tutmak icin
-    uint8_t time_buffer_rtc[8];
-    // SD karta yazmak icin
-    char time_buffer[64];
+	char buffer[64];
 
-    DS1302_ReadTime(time_buffer_rtc);
+	sprintf(buffer,"ADC degeri = %lu\r\n",adcBuf);
 
-    // Zaman bilgisini yazabilecek formata cevir
-    sprintf(time_buffer, "%02d-%02d-%02d %02d:%02d:%02d\r\n",
-            2000 + time_buffer_rtc[1], time_buffer_rtc[2], time_buffer_rtc[3],
-            time_buffer_rtc[4], time_buffer_rtc[5], time_buffer_rtc[6]);
-
-    FR_Status = f_open(&Fil, "TimeLog.txt", FA_OPEN_APPEND | FA_WRITE);
+    FR_Status = f_open(&Fil, "ADCLog.txt", FA_OPEN_APPEND | FA_WRITE);
 
     if (FR_Status == FR_OK)
     {
         // Zaman bilgisini dosyaya yaz
-        f_puts(time_buffer, &Fil);
+        f_puts(buffer, &Fil);
         // Yazilan zaman bilgisini bluetooth uzerinden gonder
-        UART_Print(time_buffer);
+        uart_print(buffer);
         f_close(&Fil);
     }
     else
     {
         // Hata mesaji
-    	UART_Print("Hata! Zaman bilgisi yazilamadi...");
+    	uart_print("Hata! Zaman bilgisi yazilamadi...");
     }
 }
 
-static void SD_Card_TimeLogger(void)
+static void sd_card_adc_logger(void)
 {
 
 	int counter = 0;
@@ -704,14 +702,14 @@ static void SD_Card_TimeLogger(void)
     FR_Status = f_mount(&FatFs, "", 1);
     if (FR_Status != FR_OK)
     {
-        UART_Print("Hata! SD Kart Yerlestirilemedi...");
+        uart_print("Hata! SD Kart Yerlestirilemedi...");
         return;
     }
 
     // Durmadan yazma yapma, maxWrite kadar yaz ve SD karti kaldir
     while (counter < maxWrites)
     {
-    	writeTimeToSD(); // Zamanı SD karta yaz
+    	write_adc_to_SD(); // Zamanı SD karta yaz
         HAL_Delay(1000); // 1 saniye bekle
         counter++;       // Sayacı artir
     }
