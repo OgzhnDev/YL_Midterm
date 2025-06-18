@@ -22,4 +22,4 @@ Disco On: Activates disco mode, causing the RGB LED to cycle through colors in r
 
 Disco Off: Deactivates disco mode and returns the RGB LED to its normal state.
 
-Each command triggers a specific behavior, allowing for flexible control and easy data logging during your midterm evaluation.
+Each command triggers a specific behavior, allowing for flexible control and easy data logging.
